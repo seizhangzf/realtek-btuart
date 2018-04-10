@@ -546,13 +546,7 @@ static int hci_uart_register_dev(struct hci_uart *hu)
 	 * before this function called in hci_uart_set_proto()
 	 */
 
-#if ((LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 38)) && \
-(LINUX_VERSION_CODE < KERNEL_VERSION(3, 5, 0)))
-	hdev->parent = hu->tty->dev;
-#endif
-#if HCI_VERSION_CODE >= KERNEL_VERSION(3, 5, 0)
 	SET_HCIDEV_DEV(hdev, hu->tty->dev);
-#endif
 
 #if HCI_VERSION_CODE < KERNEL_VERSION(3, 4, 0)
 	hdev->destruct = hci_uart_destruct;
@@ -587,7 +581,11 @@ static int hci_uart_register_dev(struct hci_uart *hu)
 	if (test_bit(HCI_UART_CREATE_AMP, &hu->hdev_flags))
 		hdev->dev_type = HCI_AMP;
 	else
-		hdev->dev_type = 0;
+#if HCI_VERSION_CODE < KERNEL_VERSION(4, 8, 0)
+		hdev->dev_type = HCI_BREDR;
+#else
+		hdev->dev_type = HCI_PRIMARY;
+#endif
 #endif
 
 	if (hci_register_dev(hdev) < 0) {

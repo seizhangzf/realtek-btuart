@@ -90,7 +90,7 @@ typedef uint16_t RT_U16, *PRT_U16;
 typedef int32_t RT_S32, *PRT_S32;
 typedef uint32_t RT_U32, *PRT_U32;
 
-RT_U8 DBG_ON = 1;
+RT_U8 DBG_ON = 0;
 #define LOG_STR     "Realtek Bluetooth"
 #define RS_DBG(fmt, arg...) \
     do{ \
