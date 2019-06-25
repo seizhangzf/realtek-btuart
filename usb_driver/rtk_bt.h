@@ -43,35 +43,12 @@
 
 #define BTCOEX
 
-#if 1
-#define RTKBT_DBG(fmt, arg...) printk(KERN_INFO "rtk_btusb: " fmt "\n" , ## arg)
-#define RTKBT_INFO(fmt, arg...) printk(KERN_INFO "rtk_btusb: " fmt "\n" , ## arg)
-#define RTKBT_WARN(fmt, arg...) printk(KERN_WARNING "rtk_btusb: " fmt "\n", ## arg)
-#else
-#define RTKBT_DBG(fmt, arg...)
-#endif
-
-#if 1
-#define RTKBT_ERR(fmt, arg...) printk(KERN_ERR "rtk_btusb: " fmt "\n" , ## arg)
-#else
-#define RTKBT_ERR(fmt, arg...)
-#endif
-
 /***********************************
 ** Realtek - For rtk_btusb driver **
 ***********************************/
-#define BTUSB_RPM		0* USB_RPM	//      1 SS enable; 0 SS disable
 #define BTUSB_WAKEUP_HOST		0	/* 1  enable; 0  disable */
 
-/* If, when os suspend, module is still powered,
- * no needs binding, and must comply with special patch code
- */
-#define CONFIG_NEEDS_BINDING		1
-
 #define URB_CANCELING_DELAY_MS	10	// Added by Realtek
-#define PRINT_CMD_EVENT			0
-#define PRINT_ACL_DATA			0
-
 #if HCI_VERSION_CODE > KERNEL_VERSION(2, 6, 33)
 #define HDEV_BUS		hdev->bus
 #else
@@ -164,41 +141,6 @@ struct btusb_data {
 #if HCI_VERSION_CODE >= KERNEL_VERSION(3, 18, 0)
 	int (*recv_bulk) (struct btusb_data * data, void *buffer, int count);
 #endif
+	struct notifier_block pm_notifier;
+	void *context;
 };
-
-#define HCI_CMD_READ_BD_ADDR                0x1009
-#define HCI_VENDOR_CHANGE_BDRATE            0xfc17
-#define HCI_VENDOR_READ_RTK_ROM_VERISION    0xfc6d
-#define HCI_VENDOR_READ_LMP_VERISION        0x1001
-
-#define ROM_LMP_NONE                0x0000
-#define ROM_LMP_8723a               0x1200
-#define ROM_LMP_8723b               0x8723
-#define ROM_LMP_8821a               0X8821
-#define ROM_LMP_8761a               0X8761
-#define ROM_LMP_8822b               0X8822
-
-struct rtk_eversion_evt {
-	uint8_t status;
-	uint8_t version;
-} __attribute__ ((packed));
-
-struct rtk_epatch_entry {
-	uint16_t chipID;
-	uint16_t patch_length;
-	uint32_t start_offset;
-} __attribute__ ((packed));
-
-struct rtk_epatch {
-	uint8_t signature[8];
-	uint32_t fw_version;
-	uint16_t number_of_total_patch;
-	struct rtk_epatch_entry entry[0];
-} __attribute__ ((packed));
-
-struct rtk_extension_entry {
-	uint8_t opcode;
-	uint8_t length;
-	uint8_t *data;
-} __attribute__ ((packed));
-/* Realtek - For rtk_btusb driver end */

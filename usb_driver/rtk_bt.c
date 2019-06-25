@@ -33,14 +33,19 @@
 #include <asm/unaligned.h>
 
 #include "rtk_bt.h"
+#include "rtk_misc.h"
 
-#define VERSION "3.1"
+#define VERSION "3.1.a2fd257.20190618-195354"
 
 #ifdef BTCOEX
 #include "rtk_coex.h"
 #endif
 
-static uint8_t gEVersion = 0xFF;
+#ifdef RTKBT_SWITCH_PATCH
+#include <linux/semaphore.h>
+#include <net/bluetooth/hci_core.h>
+DEFINE_SEMAPHORE(switch_sem);
+#endif
 
 #if HCI_VERSION_CODE >= KERNEL_VERSION(3, 7, 1)
 static bool reset = 0;
@@ -832,6 +837,21 @@ static int btusb_close(struct hci_dev *hdev)
 failed:
 	mdelay(URB_CANCELING_DELAY_MS);	// Added by Realtek
 	usb_scuttle_anchored_urbs(&data->deferred);
+
+#ifdef RTKBT_SWITCH_PATCH
+	down(&switch_sem);
+	if (data->context) {
+		struct api_context *ctx = data->context;
+
+		if (ctx->flags & RTLBT_CLOSE) {
+			ctx->flags &= ~RTLBT_CLOSE;
+			ctx->status = 0;
+			complete(&ctx->done);
+		}
+	}
+	up(&switch_sem);
+#endif
+
 	return 0;
 }
 
@@ -1140,6 +1160,161 @@ static void btusb_waker(struct work_struct *work)
 		  atomic_read(&(data->intf->pm_usage_cnt)));
 }
 
+int rtkbt_pm_notify(struct notifier_block *notifier,
+		    ulong pm_event, void *unused)
+{
+	struct btusb_data *data;
+	struct usb_device *udev;
+	struct usb_interface *intf;
+	struct hci_dev *hdev;
+	/* int err; */
+#ifdef RTKBT_SWITCH_PATCH
+	u8 *cmd;
+	int result;
+	static u8 hci_state = 0;
+	struct api_context ctx;
+#endif
+
+	data = container_of(notifier, struct btusb_data, pm_notifier);
+	udev = data->udev;
+	intf = data->intf;
+	hdev = data->hdev;
+
+	RTKBT_DBG("%s: pm_event %ld", __func__, pm_event);
+	switch (pm_event) {
+	case PM_SUSPEND_PREPARE:
+	case PM_HIBERNATION_PREPARE:
+		/* No need to load firmware because the download firmware
+		 * process is deprecated in resume.
+		 * We use rebind after resume instead */
+		/* err = usb_autopm_get_interface(data->intf);
+		 * if (err < 0)
+		 * 	return err;
+		 * patch_entry->fw_len =
+		 *     load_firmware(dev_entry, &patch_entry->fw_cache);
+		 * usb_autopm_put_interface(data->intf);
+		 * if (patch_entry->fw_len <= 0) {
+		 * 	RTKBT_DBG("rtkbt_pm_notify return NOTIFY_BAD");
+		 * 	return NOTIFY_BAD;
+		 * } */
+
+		RTKBT_DBG("%s: suspend prepare", __func__);
+
+		if (!device_may_wakeup(&udev->dev)) {
+#ifdef CONFIG_NEEDS_BINDING
+			intf->needs_binding = 1;
+			RTKBT_DBG("Remote wakeup not support, set "
+				  "intf->needs_binding = 1");
+#else
+			RTKBT_DBG("Remote wakeup not support, no needs binding");
+#endif
+		}
+
+#ifdef RTKBT_SWITCH_PATCH
+		if (test_bit(HCI_UP, &hdev->flags)) {
+			unsigned long expire;
+
+			init_completion(&ctx.done);
+			hci_state = 1;
+
+			down(&switch_sem);
+			data->context = &ctx;
+			ctx.flags = RTLBT_CLOSE;
+			queue_work(hdev->req_workqueue, &hdev->power_off.work);
+			up(&switch_sem);
+
+			expire = msecs_to_jiffies(1000);
+			if (!wait_for_completion_timeout(&ctx.done, expire))
+				RTKBT_ERR("hdev close timeout");
+
+			down(&switch_sem);
+			data->context = NULL;
+			up(&switch_sem);
+		}
+
+		cmd = kzalloc(16, GFP_ATOMIC);
+		if (!cmd) {
+			RTKBT_ERR("Can't allocate memory for cmd");
+			return -ENOMEM;
+		}
+
+		/* Clear patch */
+		cmd[0] = 0x66;
+		cmd[1] = 0xfc;
+		cmd[2] = 0x00;
+
+		result = __rtk_send_hci_cmd(udev, cmd, 3);
+		kfree(cmd);
+		msleep(100); /* From FW colleague's recommendation */
+		result = download_lps_patch(intf);
+
+		/* Tell the controller to wake up host if received special
+		 * advertising packet
+		 */
+		set_scan(intf);
+
+		/* Send special vendor commands */
+#endif
+
+		break;
+
+	case PM_POST_SUSPEND:
+	case PM_POST_HIBERNATION:
+	case PM_POST_RESTORE:
+		/* if (patch_entry->fw_len > 0) {
+		 * 	kfree(patch_entry->fw_cache);
+		 * 	patch_entry->fw_cache = NULL;
+		 * 	patch_entry->fw_len = 0;
+		 * } */
+
+#ifdef RTKBT_SWITCH_PATCH
+		cmd = kzalloc(16, GFP_ATOMIC);
+		if (!cmd) {
+			RTKBT_ERR("Can't allocate memory for cmd");
+			return -ENOMEM;
+		}
+
+		/* Clear patch */
+		cmd[0] = 0x66;
+		cmd[1] = 0xfc;
+		cmd[2] = 0x00;
+
+		result = __rtk_send_hci_cmd(udev, cmd, 3);
+		kfree(cmd);
+		msleep(100); /* From FW colleague's recommendation */
+		result = download_patch(intf);
+		if (hci_state) {
+			hci_state = 0;
+			queue_work(hdev->req_workqueue, &hdev->power_on);
+		}
+#endif
+
+#if BTUSB_RPM
+		RTKBT_DBG("%s: Re-enable autosuspend", __func__);
+		/* pm_runtime_use_autosuspend(&udev->dev);
+		 * pm_runtime_set_autosuspend_delay(&udev->dev, 2000);
+		 * pm_runtime_set_active(&udev->dev);
+		 * pm_runtime_allow(&udev->dev);
+		 * pm_runtime_mark_last_busy(&udev->dev);
+		 * pm_runtime_autosuspend(&udev->dev);
+		 * pm_runtime_put_autosuspend(&udev->dev);
+		 * usb_disable_autosuspend(udev); */
+		/* FIXME: usb_enable_autosuspend(udev) is useless here.
+		 * Because it is always enabled after enabled in btusb_probe()
+		 */
+		usb_enable_autosuspend(udev);
+		pm_runtime_mark_last_busy(&udev->dev);
+#endif
+		break;
+
+	default:
+		break;
+	}
+
+	return NOTIFY_DONE;
+}
+
+
 static int btusb_probe(struct usb_interface *intf,
 		       const struct usb_device_id *id)
 {
@@ -1270,13 +1445,9 @@ static int btusb_probe(struct usb_interface *intf,
 		}
 	}
 
-	/* Should reset the gEVersion to 0xff, otherwise the stored gEVersion
-	 * would cause rtk_get_eversion() returning previous gEVersion if
-	 * change to different ECO chip.
-	 * This would cause downloading wrong patch, and the controller can't
-	 * work. */
-	RTKBT_DBG("%s: Reset gEVersion to 0xff", __func__);
-	gEVersion = 0xff;
+#if HCI_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)
+	set_bit(HCI_QUIRK_SIMULTANEOUS_DISCOVERY, &hdev->quirks);
+#endif
 
 	err = hci_register_dev(hdev);
 	if (err < 0) {
@@ -1286,6 +1457,10 @@ static int btusb_probe(struct usb_interface *intf,
 	}
 
 	usb_set_intfdata(intf, data);
+
+	/* Register PM notifier */
+	data->pm_notifier.notifier_call = rtkbt_pm_notify;
+	register_pm_notifier(&data->pm_notifier);
 
 #ifdef BTCOEX
 	rtk_btcoex_probe(hdev);
@@ -1310,6 +1485,10 @@ static void btusb_disconnect(struct usb_interface *intf)
 		return;
 
 	RTKBT_DBG("btusb_disconnect");
+
+	/* Un-register PM notifier */
+	unregister_pm_notifier(&data->pm_notifier);
+
 	/*******************************/
 	patch_remove(intf);
 	/*******************************/
@@ -1356,8 +1535,8 @@ static int btusb_suspend(struct usb_interface *intf, pm_message_t message)
 	RTKBT_DBG("btusb_suspend message.event 0x%x, data->suspend_count %d",
 		  message.event, data->suspend_count);
 	if (!test_bit(HCI_RUNNING, &data->hdev->flags)) {
-		RTKBT_DBG("btusb_suspend-----bt is off");
-		set_btoff(data->intf);
+		RTKBT_INFO("%s: hdev is not HCI_RUNNING", __func__);
+		/* set_scan(data->intf); */
 	}
 	/*******************************/
 
@@ -1490,6 +1669,9 @@ static struct usb_driver btusb_driver = {
 #ifdef CONFIG_PM
 	.suspend = btusb_suspend,
 	.resume = btusb_resume,
+#ifdef RTKBT_SWITCH_PATCH
+	.reset_resume = btusb_resume,
+#endif
 #endif
 	.id_table = btusb_table,
 	.supports_autosuspend = 1,
@@ -1524,1238 +1706,3 @@ MODULE_AUTHOR("");
 MODULE_DESCRIPTION("Realtek Bluetooth USB driver ver " VERSION);
 MODULE_VERSION(VERSION);
 MODULE_LICENSE("GPL");
-
-/*******************************
-**    Reasil patch code
-********************************/
-#define CMD_CMP_EVT		    0x0e
-#define PKT_LEN			    300
-#define MSG_TO			    1000	//us
-#define PATCH_SEG_MAX	    252
-/* #define PATCH_LENGTH_MAX    24576 */ //24*1024
-#define PATCH_LENGTH_MAX	(40 * 1024)
-#define DATA_END		    0x80
-#define DOWNLOAD_OPCODE	    0xfc20
-#define BTOFF_OPCODE	    0xfc28
-#define TRUE			    1
-#define FALSE			    0
-#define CMD_HDR_LEN		    sizeof(struct hci_command_hdr)
-#define EVT_HDR_LEN		    sizeof(struct hci_event_hdr)
-#define CMD_CMP_LEN		    sizeof(struct hci_ev_cmd_complete)
-
-//signature: Realtech
-const uint8_t RTK_EPATCH_SIGNATURE[8] =
-    { 0x52, 0x65, 0x61, 0x6C, 0x74, 0x65, 0x63, 0x68 };
-//Extension Section IGNATURE:0x77FD0451
-const uint8_t Extension_Section_SIGNATURE[4] = { 0x51, 0x04, 0xFD, 0x77 };
-
-uint16_t project_id[] = {
-	ROM_LMP_8723a,
-	ROM_LMP_8723b,
-	ROM_LMP_8821a,
-	ROM_LMP_8761a,
-	ROM_LMP_NONE,
-	ROM_LMP_NONE,
-	ROM_LMP_NONE,
-	ROM_LMP_NONE,
-	ROM_LMP_8822b,
-	ROM_LMP_8723b, /* RTL8723DU */
-	ROM_LMP_8821a, /* RTL8821CU */
-	ROM_LMP_NONE
-};
-
-enum rtk_endpoit {
-	CTRL_EP = 0,
-	INTR_EP = 1,
-	BULK_EP = 2,
-	ISOC_EP = 3
-};
-
-typedef struct {
-	uint16_t prod_id;
-	uint16_t lmp_sub;
-	char *mp_patch_name;
-	char *patch_name;
-	char *config_name;
-
-	/* TODO: Remove the following avariables */
-	uint8_t *fw_cache1;
-	int fw_len1;
-} patch_info;
-
-typedef struct {
-	struct list_head list_node;
-	struct usb_interface *intf;
-	struct usb_device *udev;
-	struct notifier_block pm_notifier;
-	patch_info *patch_entry;
-} dev_data;
-
-typedef struct {
-	dev_data *dev_entry;
-	int pipe_in, pipe_out;
-	uint8_t *send_pkt;
-	uint8_t *rcv_pkt;
-	struct hci_command_hdr *cmd_hdr;
-	struct hci_event_hdr *evt_hdr;
-	struct hci_ev_cmd_complete *cmd_cmp;
-	uint8_t *req_para, *rsp_para;
-	uint8_t *fw_data;
-	int pkt_len, fw_len;
-} xchange_data;
-
-typedef struct {
-	uint8_t index;
-	uint8_t data[PATCH_SEG_MAX];
-} __attribute__ ((packed)) download_cp;
-
-typedef struct {
-	uint8_t status;
-	uint8_t index;
-} __attribute__ ((packed)) download_rp;
-
-#define RTK_VENDOR_CONFIG_MAGIC 0x8723ab55
-struct rtk_bt_vendor_config_entry {
-	uint16_t offset;
-	uint8_t entry_len;
-	uint8_t entry_data[0];
-} __attribute__ ((packed));
-
-struct rtk_bt_vendor_config {
-	uint32_t signature;
-	uint16_t data_len;
-	struct rtk_bt_vendor_config_entry entry[0];
-} __attribute__ ((packed));
-
-static dev_data *dev_data_find(struct usb_interface *intf);
-static patch_info *get_patch_entry(struct usb_device *udev);
-static int rtkbt_pm_notify(struct notifier_block *notifier, ulong pm_event,
-			   void *unused);
-static int load_firmware(dev_data * dev_entry, uint8_t ** buff);
-static void init_xdata(xchange_data * xdata, dev_data * dev_entry);
-static int check_fw_version(xchange_data * xdata);
-static int download_data(xchange_data * xdata);
-static int send_hci_cmd(xchange_data * xdata);
-static int rcv_hci_evt(xchange_data * xdata);
-static uint8_t rtk_get_eversion(dev_data * dev_entry);
-
-static patch_info fw_patch_table[] = {
-/* { pid, lmp_sub, mp_fw_name, fw_name, config_name, fw_cache, fw_len } */
-	{0x1724, 0x1200, "mp_rtl8723a_fw", "rtl8723a_fw", "rtl8723a_config", NULL, 0},	/* RTL8723A */
-	{0x8723, 0x1200, "mp_rtl8723a_fw", "rtl8723a_fw", "rtl8723a_config", NULL, 0},	/* 8723AE */
-	{0xA723, 0x1200, "mp_rtl8723a_fw", "rtl8723a_fw", "rtl8723a_config", NULL, 0},	/* 8723AE for LI */
-	{0x0723, 0x1200, "mp_rtl8723a_fw", "rtl8723a_fw", "rtl8723a_config", NULL, 0},	/* 8723AE */
-	{0x3394, 0x1200, "mp_rtl8723a_fw", "rtl8723a_fw", "rtl8723a_config", NULL, 0},	/* 8723AE for Azurewave */
-
-	{0x0724, 0x1200, "mp_rtl8723a_fw", "rtl8723a_fw", "rtl8723a_config", NULL, 0},	/* 8723AU */
-	{0x8725, 0x1200, "mp_rtl8723a_fw", "rtl8723a_fw", "rtl8723a_config", NULL, 0},	/* 8723AU */
-	{0x872A, 0x1200, "mp_rtl8723a_fw", "rtl8723a_fw", "rtl8723a_config", NULL, 0},	/* 8723AU */
-	{0x872B, 0x1200, "mp_rtl8723a_fw", "rtl8723a_fw", "rtl8723a_config", NULL, 0},	/* 8723AU */
-
-	{0xb720, 0x8723, "mp_rtl8723b_fw", "rtl8723b_fw", "rtl8723bu_config", NULL, 0},	/* RTL8723BU */
-	{0xb72A, 0x8723, "mp_rtl8723b_fw", "rtl8723b_fw", "rtl8723bu_config", NULL, 0},	/* RTL8723BU */
-	{0xb728, 0x8723, "mp_rtl8723b_fw", "rtl8723b_fw", "rtl8723b_config", NULL, 0},	/* RTL8723BE for LC */
-	{0xb723, 0x8723, "mp_rtl8723b_fw", "rtl8723b_fw", "rtl8723b_config", NULL, 0},	/* RTL8723BE */
-	{0xb72B, 0x8723, "mp_rtl8723b_fw", "rtl8723b_fw", "rtl8723b_config", NULL, 0},	/* RTL8723BE */
-	{0xb001, 0x8723, "mp_rtl8723b_fw", "rtl8723b_fw", "rtl8723b_config", NULL, 0},	/* RTL8723BE for HP */
-	{0xb002, 0x8723, "mp_rtl8723b_fw", "rtl8723b_fw", "rtl8723b_config", NULL, 0},	/* RTL8723BE */
-	{0xb003, 0x8723, "mp_rtl8723b_fw", "rtl8723b_fw", "rtl8723b_config", NULL, 0},	/* RTL8723BE */
-	{0xb004, 0x8723, "mp_rtl8723b_fw", "rtl8723b_fw", "rtl8723b_config", NULL, 0},	/* RTL8723BE */
-	{0xb005, 0x8723, "mp_rtl8723b_fw", "rtl8723b_fw", "rtl8723b_config", NULL, 0},	/* RTL8723BE */
-
-	{0x3410, 0x8723, "mp_rtl8723b_fw", "rtl8723b_fw", "rtl8723b_config", NULL, 0},	/* RTL8723BE for Azurewave */
-	{0x3416, 0x8723, "mp_rtl8723b_fw", "rtl8723b_fw", "rtl8723b_config", NULL, 0},	/* RTL8723BE for Azurewave */
-	{0x3459, 0x8723, "mp_rtl8723b_fw", "rtl8723b_fw", "rtl8723b_config", NULL, 0},	/* RTL8723BE for Azurewave */
-	{0xE085, 0x8723, "mp_rtl8723b_fw", "rtl8723b_fw", "rtl8723b_config", NULL, 0},	/* RTL8723BE for Foxconn */
-	{0xE08B, 0x8723, "mp_rtl8723b_fw", "rtl8723b_fw", "rtl8723b_config", NULL, 0},	/* RTL8723BE for Foxconn */
-	{0xE09E, 0x8723, "mp_rtl8723b_fw", "rtl8723b_fw", "rtl8723b_config", NULL, 0},	/* RTL8723BE for Foxconn */
-
-	{0xA761, 0x8761, "mp_rtl8761a_fw", "rtl8761au_fw", "rtl8761a_config", NULL, 0},	/* RTL8761AU only */
-	{0x818B, 0x8761, "mp_rtl8761a_fw", "rtl8761aw_fw", "rtl8761aw_config", NULL, 0},	/* RTL8761AW + 8192EU */
-	{0x818C, 0x8761, "mp_rtl8761a_fw", "rtl8761aw_fw", "rtl8761aw_config", NULL, 0},	/* RTL8761AW + 8192EU */
-	{0x8760, 0x8761, "mp_rtl8761a_fw", "rtl8761au_fw", "rtl8761a_config", NULL, 0},	/* RTL8761AU + 8192EE */
-	{0xB761, 0x8761, "mp_rtl8761a_fw", "rtl8761au_fw", "rtl8761a_config", NULL, 0},	/* RTL8761AU + 8192EE */
-	{0x8761, 0x8761, "mp_rtl8761a_fw", "rtl8761au_fw", "rtl8761a_config", NULL, 0},	/* RTL8761AU + 8192EE for LI */
-	{0x8A60, 0x8761, "mp_rtl8761a_fw", "rtl8761au_fw", "rtl8761a_config", NULL, 0},	/* RTL8761AU + 8812AE */
-
-	{0x8821, 0x8821, "mp_rtl8821a_fw", "rtl8821a_fw", "rtl8821a_config", NULL, 0},	/* RTL8821AE */
-	{0x0821, 0x8821, "mp_rtl8821a_fw", "rtl8821a_fw", "rtl8821a_config", NULL, 0},	/* RTL8821AE */
-	{0x0823, 0x8821, "mp_rtl8821a_fw", "rtl8821a_fw", "rtl8821a_config", NULL, 0},	/* RTL8821AU */
-	{0x3414, 0x8821, "mp_rtl8821a_fw", "rtl8821a_fw", "rtl8821a_config", NULL, 0},	/* RTL8821AE */
-	{0x3458, 0x8821, "mp_rtl8821a_fw", "rtl8821a_fw", "rtl8821a_config", NULL, 0},	/* RTL8821AE */
-	{0x3461, 0x8821, "mp_rtl8821a_fw", "rtl8821a_fw", "rtl8821a_config", NULL, 0},	/* RTL8821AE */
-	{0x3462, 0x8821, "mp_rtl8821a_fw", "rtl8821a_fw", "rtl8821a_config", NULL, 0},	/* RTL8821AE */
-
-	{0xb82c, 0x8822, "mp_rtl8822bu_fw", "rtl8822bu_fw", "rtl8822bu_config", NULL, 0}, /* RTL8822BU */
-	{0xd723, 0x8723, "mp_rtl8723du_fw", "rtl8723du_fw", "rtl8723du_config", NULL, 0}, /* RTL8723DU */
-	{0xb820, 0x8821, "mp_rtl8821cu_fw", "rtl8821cu_fw", "rtl8821cu_config", NULL, 0 }, /* RTL8821CU */
-	{0xc820, 0x8821, "mp_rtl8821cu_fw", "rtl8821cu_fw", "rtl8821cu_config", NULL, 0 }, /* RTL8821CU */
-
-/* NOTE: must append patch entries above the null entry */
-	{0, 0, NULL, NULL, NULL, NULL, 0}
-};
-
-static LIST_HEAD(dev_data_list);
-
-int patch_add(struct usb_interface *intf)
-{
-	dev_data *dev_entry;
-	struct usb_device *udev;
-
-	RTKBT_DBG("patch_add");
-	dev_entry = dev_data_find(intf);
-	if (NULL != dev_entry) {
-		return -1;
-	}
-
-	udev = interface_to_usbdev(intf);
-#if BTUSB_RPM
-	RTKBT_DBG("auto suspend is enabled");
-	usb_enable_autosuspend(udev);
-	pm_runtime_set_autosuspend_delay(&(udev->dev), 2000);
-#else
-	RTKBT_DBG("auto suspend is disabled");
-	usb_disable_autosuspend(udev);
-#endif
-
-	dev_entry = kzalloc(sizeof(dev_data), GFP_KERNEL);
-	dev_entry->intf = intf;
-	dev_entry->udev = udev;
-	dev_entry->pm_notifier.notifier_call = rtkbt_pm_notify;
-	dev_entry->patch_entry = get_patch_entry(udev);
-	if (NULL == dev_entry->patch_entry) {
-		kfree(dev_entry);
-		return -1;
-	}
-	list_add(&dev_entry->list_node, &dev_data_list);
-	register_pm_notifier(&dev_entry->pm_notifier);
-
-	return 0;
-}
-
-void patch_remove(struct usb_interface *intf)
-{
-	dev_data *dev_entry;
-	struct usb_device *udev;
-
-	udev = interface_to_usbdev(intf);
-#if BTUSB_RPM
-	usb_disable_autosuspend(udev);
-#endif
-
-	dev_entry = dev_data_find(intf);
-	if (NULL == dev_entry) {
-		return;
-	}
-
-	RTKBT_DBG("patch_remove");
-	list_del(&dev_entry->list_node);
-	unregister_pm_notifier(&dev_entry->pm_notifier);
-	kfree(dev_entry);
-}
-
-static int send_reset_command(xchange_data *xdata)
-{
-	int ret_val;
-
-	RTKBT_DBG("HCI reset.");
-
-	xdata->cmd_hdr->opcode = cpu_to_le16(HCI_OP_RESET);
-	xdata->cmd_hdr->plen = 0;
-	xdata->pkt_len = CMD_HDR_LEN;
-
-	ret_val = send_hci_cmd(xdata);
-	if (ret_val < 0) {
-		RTKBT_ERR("failed to send hci cmd.");
-		return ret_val;
-	}
-
-	ret_val = rcv_hci_evt(xdata);
-	if (ret_val < 0) {
-		RTKBT_ERR("failed to recv hci event.");
-		return ret_val;
-	}
-
-	return 0;
-}
-
-int download_patch(struct usb_interface *intf)
-{
-	dev_data *dev_entry;
-	xchange_data *xdata = NULL;
-	uint8_t *fw_buf;
-	int ret_val;
-
-	RTKBT_DBG("download_patch start");
-	dev_entry = dev_data_find(intf);
-	if (NULL == dev_entry) {
-		ret_val = -1;
-		RTKBT_ERR("NULL == dev_entry");
-		goto patch_end;
-	}
-
-	xdata = kzalloc(sizeof(xchange_data), GFP_KERNEL);
-	if (NULL == xdata) {
-		ret_val = -1;
-		RTKBT_DBG("NULL == xdata");
-		goto patch_end;
-	}
-
-	init_xdata(xdata, dev_entry);
-
-	ret_val = check_fw_version(xdata);
-	if (ret_val < 0) {
-		RTKBT_ERR("Failed to get Local Version Information");
-		goto patch_end;
-
-	} else if (ret_val > 0) {
-		RTKBT_DBG("Firmware already exists");
-		/* Patch alread exists, just return */
-		if (gEVersion == 0xff) {
-			RTKBT_DBG("global_version is not set, get it!");
-			gEVersion = rtk_get_eversion(dev_entry);
-		}
-		goto patch_end;
-	}
-
-	xdata->fw_len = load_firmware(dev_entry, &xdata->fw_data);
-	if (xdata->fw_len <= 0) {
-		RTKBT_ERR("load firmware failed!");
-		goto patch_end;
-	}
-
-	fw_buf = xdata->fw_data;
-
-	if (xdata->fw_len > PATCH_LENGTH_MAX) {
-		RTKBT_ERR("FW/CONFIG total length larger than allowed!");
-		goto patch_fail;
-	}
-
-	ret_val = download_data(xdata);
-	if (ret_val < 0) {
-		RTKBT_ERR("download_data failed, err %d", ret_val);
-		goto patch_fail;
-	}
-
-	ret_val = check_fw_version(xdata);
-	if (ret_val <= 0) {
-		RTKBT_ERR("%s: Read Local Version Info failure after download",
-			  __func__);
-		ret_val = -1;
-		goto patch_fail;
-	}
-
-	ret_val = 0;
-patch_fail:
-	kfree(fw_buf);
-patch_end:
-	if (xdata != NULL) {
-		if (xdata->send_pkt)
-			kfree(xdata->send_pkt);
-		if (xdata->rcv_pkt)
-			kfree(xdata->rcv_pkt);
-		kfree(xdata);
-	}
-	RTKBT_DBG("Rtk patch end %d", ret_val);
-	return ret_val;
-}
-
-int set_btoff(struct usb_interface *intf)
-{
-	dev_data *dev_entry;
-	xchange_data *xdata = NULL;
-	int ret_val;
-
-	RTKBT_DBG("set_btoff");
-	dev_entry = dev_data_find(intf);
-	if (NULL == dev_entry) {
-		return -1;
-	}
-
-	xdata = kzalloc(sizeof(xchange_data), GFP_KERNEL);
-	if (NULL == xdata) {
-		ret_val = -1;
-		RTKBT_DBG("NULL == xdata");
-		return ret_val;
-	}
-
-	init_xdata(xdata, dev_entry);
-
-	xdata->cmd_hdr->opcode = cpu_to_le16(BTOFF_OPCODE);
-	xdata->cmd_hdr->plen = 1;
-	xdata->pkt_len = CMD_HDR_LEN + 1;
-	xdata->send_pkt[CMD_HDR_LEN] = 1;
-
-	ret_val = send_hci_cmd(xdata);
-	if (ret_val < 0) {
-		goto tagEnd;
-	}
-
-	ret_val = rcv_hci_evt(xdata);
-	if (ret_val < 0) {
-		goto tagEnd;
-	}
-
-tagEnd:
-	if (xdata != NULL) {
-		if (xdata->send_pkt)
-			kfree(xdata->send_pkt);
-		if (xdata->rcv_pkt)
-			kfree(xdata->rcv_pkt);
-		kfree(xdata);
-	}
-
-	RTKBT_DBG("set_btoff done");
-
-	return ret_val;
-}
-
-dev_data *dev_data_find(struct usb_interface * intf)
-{
-	dev_data *dev_entry;
-
-	list_for_each_entry(dev_entry, &dev_data_list, list_node) {
-		if (dev_entry->intf == intf) {
-			return dev_entry;
-		}
-	}
-
-	return NULL;
-}
-
-patch_info *get_patch_entry(struct usb_device * udev)
-{
-	patch_info *patch_entry;
-	uint16_t pid;
-
-	patch_entry = fw_patch_table;
-	pid = le16_to_cpu(udev->descriptor.idProduct);
-	RTKBT_DBG("pid = 0x%x", pid);
-	while (pid != patch_entry->prod_id) {
-		if (0 == patch_entry->prod_id) {
-			RTKBT_DBG
-			    ("get_patch_entry =NULL, can not find device pid in patch_table");
-			return NULL;	//break;
-		}
-		patch_entry++;
-	}
-
-	return patch_entry;
-}
-
-int rtkbt_pm_notify(struct notifier_block *notifier,
-		    ulong pm_event, void *unused)
-{
-	dev_data *dev_entry;
-	patch_info *patch_entry;
-	struct usb_device *udev;
-	/* int err; */
-	/* struct btusb_data *data; */
-
-	dev_entry = container_of(notifier, dev_data, pm_notifier);
-	/* data = usb_get_intfdata(dev_entry->intf); */
-	patch_entry = dev_entry->patch_entry;
-	udev = dev_entry->udev;
-	RTKBT_DBG("%s: pm_event %ld", __func__, pm_event);
-	switch (pm_event) {
-	case PM_SUSPEND_PREPARE:
-	case PM_HIBERNATION_PREPARE:
-		/* No need to load firmware because the download firmware
-		 * process is deprecated in resume.
-		 * We use rebind after resume instead */
-		/* err = usb_autopm_get_interface(data->intf);
-		 * if (err < 0)
-		 * 	return err;
-		 * patch_entry->fw_len =
-		 *     load_firmware(dev_entry, &patch_entry->fw_cache);
-		 * usb_autopm_put_interface(data->intf);
-		 * if (patch_entry->fw_len <= 0) {
-		 * 	RTKBT_DBG("rtkbt_pm_notify return NOTIFY_BAD");
-		 * 	return NOTIFY_BAD;
-		 * } */
-
-		RTKBT_DBG("%s: suspend prepare", __func__);
-
-		if (!device_may_wakeup(&udev->dev)) {
-#if (CONFIG_NEEDS_BINDING)
-			dev_entry->intf->needs_binding = 1;
-			RTKBT_DBG("Remote wakeup not support, set "
-				  "intf->needs_binding = 1");
-#else
-			RTKBT_DBG("Remote wakeup not support, no needs binding");
-#endif
-		}
-		break;
-
-	case PM_POST_SUSPEND:
-	case PM_POST_HIBERNATION:
-	case PM_POST_RESTORE:
-		/* if (patch_entry->fw_len > 0) {
-		 * 	kfree(patch_entry->fw_cache);
-		 * 	patch_entry->fw_cache = NULL;
-		 * 	patch_entry->fw_len = 0;
-		 * } */
-#if BTUSB_RPM
-		RTKBT_DBG("%s: Re-enable autosuspend", __func__);
-		/* pm_runtime_use_autosuspend(&udev->dev);
-		 * pm_runtime_set_autosuspend_delay(&udev->dev, 2000);
-		 * pm_runtime_set_active(&udev->dev);
-		 * pm_runtime_allow(&udev->dev);
-		 * pm_runtime_mark_last_busy(&udev->dev);
-		 * pm_runtime_autosuspend(&udev->dev);
-		 * pm_runtime_put_autosuspend(&udev->dev);
-		 * usb_disable_autosuspend(udev); */
-		/* FIXME: usb_enable_autosuspend(udev) is useless here.
-		 * Because it is always enabled after enabled in btusb_probe()
-		 */
-		usb_enable_autosuspend(udev);
-		pm_runtime_mark_last_busy(&udev->dev);
-#endif
-		break;
-
-	default:
-		break;
-	}
-
-	return NOTIFY_DONE;
-}
-
-int rtk_parse_config_file(unsigned char *config_buf, int *filelen,
-			  char bt_addr[6])
-{
-	struct rtk_bt_vendor_config *config =
-	    (struct rtk_bt_vendor_config *)config_buf;
-	uint16_t config_len = 0, temp = 0;
-	struct rtk_bt_vendor_config_entry *entry = NULL;
-	unsigned int i = 0;
-	//int j = 0;
-
-	if (config == NULL)
-		return 0;
-
-	config_len = le16_to_cpu(config->data_len);
-	entry = config->entry;
-
-	if (le32_to_cpu(config->signature) != RTK_VENDOR_CONFIG_MAGIC) {
-		RTKBT_ERR
-		    ("config signature magic number(%x) is not set to RTK_VENDOR_CONFIG_MAGIC",
-		     config->signature);
-		return 0;
-	}
-
-	if (config_len != *filelen - sizeof(struct rtk_bt_vendor_config)) {
-		RTKBT_ERR("config len(%d) is not right(%zd)", config_len,
-			  *filelen - sizeof(struct rtk_bt_vendor_config));
-		return 0;
-	}
-
-	for (i = 0; i < config_len;) {
-		switch (le16_to_cpu(entry->offset)) {
-#if 0
-		case 0x3c:
-			for (j = 0; j < entry->entry_len; j++)
-				entry->entry_data[j] =
-				    bt_addr[entry->entry_len - 1 - j];
-			RTKBT_DBG("config has bdaddr");
-			break;
-#endif
-		default:
-			RTKBT_DBG("config offset(%x),length(%x)", entry->offset,
-				  entry->entry_len);
-			break;
-		}
-		temp =
-		    entry->entry_len +
-		    sizeof(struct rtk_bt_vendor_config_entry);
-		i += temp;
-		entry =
-		    (struct rtk_bt_vendor_config_entry *)((uint8_t *) entry +
-							  temp);
-	}
-
-	return 1;
-}
-
-uint8_t rtk_get_fw_project_id(uint8_t * p_buf)
-{
-	uint8_t opcode;
-	uint8_t len;
-	uint8_t data = 0;
-
-	do {
-		opcode = *p_buf;
-		len = *(p_buf - 1);
-		if (opcode == 0x00) {
-			if (len == 1) {
-				data = *(p_buf - 2);
-				RTKBT_DBG
-				    ("rtk_get_fw_project_id: opcode %d, len %d, data %d",
-				     opcode, len, data);
-				break;
-			} else {
-				RTKBT_ERR
-				    ("rtk_get_fw_project_id: invalid len %d",
-				     len);
-			}
-		}
-		p_buf -= len + 2;
-	} while (*p_buf != 0xFF);
-
-	return data;
-}
-
-static void rtk_get_patch_entry(uint8_t * epatch_buf,
-				struct rtk_epatch_entry *entry)
-{
-	uint32_t svn_ver;
-	uint32_t coex_ver;
-	uint32_t tmp;
-	uint16_t i;
-	struct rtk_epatch *epatch_info = (struct rtk_epatch *)epatch_buf;
-
-	epatch_info->number_of_total_patch =
-	    le16_to_cpu(epatch_info->number_of_total_patch);
-	RTKBT_DBG("fw_version = 0x%x", le32_to_cpu(epatch_info->fw_version));
-	RTKBT_DBG("number_of_total_patch = %d",
-		  epatch_info->number_of_total_patch);
-
-	/* get right epatch entry */
-	for (i = 0; i < epatch_info->number_of_total_patch; i++) {
-		if (get_unaligned_le16(epatch_buf + 14 + 2 * i) ==
-		    gEVersion + 1) {
-			entry->chipID = gEVersion + 1;
-			entry->patch_length = get_unaligned_le16(epatch_buf +
-					14 +
-					2 * epatch_info->number_of_total_patch +
-					2 * i);
-			entry->start_offset = get_unaligned_le32(epatch_buf +
-					14 +
-					4 * epatch_info-> number_of_total_patch +
-					4 * i);
-			break;
-		}
-	}
-
-	if (i >= epatch_info->number_of_total_patch) {
-		entry->patch_length = 0;
-		entry->start_offset = 0;
-		RTKBT_ERR("No corresponding patch found\n");
-		return;
-	}
-
-	svn_ver = get_unaligned_le32(epatch_buf +
-				entry->start_offset +
-				entry->patch_length - 8);
-	coex_ver = get_unaligned_le32(epatch_buf +
-				entry->start_offset +
-				entry->patch_length - 12);
-
-	RTKBT_DBG("chipID %d", entry->chipID);
-	RTKBT_DBG("patch_length 0x%04x", entry->patch_length);
-	RTKBT_DBG("start_offset 0x%08x", entry->start_offset);
-
-	RTKBT_DBG("Svn version: %8d", svn_ver);
-	tmp = ((coex_ver >> 16) & 0x7ff) + (coex_ver >> 27) * 10000;
-	RTKBT_DBG("Coexistence: BTCOEX_20%06d-%04x",
-		  tmp, (coex_ver & 0xffff));
-}
-
-int load_firmware(dev_data * dev_entry, uint8_t ** buff)
-{
-	const struct firmware *fw;
-	struct usb_device *udev;
-	patch_info *patch_entry;
-	char *fw_name;
-	int fw_len = 0, ret_val = 0, config_len = 0, buf_len = -1;
-	uint8_t *buf = *buff, *config_file_buf = NULL, *epatch_buf = NULL;
-	uint8_t proj_id = 0;
-	uint8_t need_download_fw = 1;
-	uint16_t lmp_version;
-	struct rtk_epatch_entry current_entry = { 0 };
-	uint8_t vnd_local_bd_addr[6] = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 };
-
-	RTKBT_DBG("load_firmware start");
-	udev = dev_entry->udev;
-	patch_entry = dev_entry->patch_entry;
-	lmp_version = patch_entry->lmp_sub;
-	RTKBT_DBG("lmp_version = 0x%04x", lmp_version);
-
-	fw_name = patch_entry->config_name;
-	RTKBT_DBG("config name is  %s", fw_name);
-
-	ret_val = request_firmware(&fw, fw_name, &udev->dev);
-	if (ret_val < 0)
-		config_len = 0;
-	else {
-		config_file_buf = kzalloc(fw->size, GFP_KERNEL);
-		if (NULL == config_file_buf)
-			goto alloc_fail;
-		memcpy(config_file_buf, fw->data, fw->size);
-		config_len = fw->size;
-		rtk_parse_config_file(config_file_buf, &config_len,
-				      vnd_local_bd_addr);
-
-	}
-
-	release_firmware(fw);
-	fw_name = patch_entry->patch_name;
-	RTKBT_ERR("fw name is  %s", fw_name);
-
-	ret_val = request_firmware(&fw, fw_name, &udev->dev);
-	if (ret_val < 0) {
-		fw_len = 0;
-		kfree(config_file_buf);
-		config_file_buf = NULL;
-		goto fw_fail;
-	}
-	epatch_buf = kzalloc(fw->size, GFP_KERNEL);
-	if (NULL == epatch_buf)
-		goto alloc_fail;
-
-	memcpy(epatch_buf, fw->data, fw->size);
-	buf_len = fw->size + config_len;
-
-	if (lmp_version == ROM_LMP_8723a) {
-		RTKBT_DBG("This is 8723a, use old patch style!");
-
-		if (memcmp(epatch_buf, RTK_EPATCH_SIGNATURE, 8) == 0) {
-			RTKBT_ERR("8723a Check signature error!");
-			need_download_fw = 0;
-		} else {
-			if (!(buf = kzalloc(buf_len, GFP_KERNEL))) {
-				RTKBT_ERR("Can't alloc memory for fw&config");
-				buf_len = -1;
-			} else {
-				RTKBT_DBG("8723a, fw copy direct");
-				memcpy(buf, epatch_buf, fw->size);
-				if (config_len) {
-					memcpy(&buf[buf_len - config_len],
-					       config_file_buf, config_len);
-				}
-			}
-		}
-	} else {
-		RTKBT_ERR("This is not 8723a, use new patch style!");
-
-		/* Get version from ROM */
-		gEVersion = rtk_get_eversion(dev_entry);
-		RTKBT_DBG("%s: New gEVersion %d", __func__, gEVersion);
-		if (gEVersion == 0xFE) {
-			RTKBT_ERR("%s: Read ROM version failure", __func__);
-			need_download_fw = 0;
-			fw_len = 0;
-			goto alloc_fail;
-		}
-
-		/* check Signature and Extension Section Field */
-		if ((memcmp(epatch_buf, RTK_EPATCH_SIGNATURE, 8) != 0) ||
-		    memcmp(epatch_buf + buf_len - config_len - 4,
-			   Extension_Section_SIGNATURE, 4) != 0) {
-			RTKBT_ERR("Check SIGNATURE error! do not download fw");
-			need_download_fw = 0;
-		} else {
-			proj_id =
-			    rtk_get_fw_project_id(epatch_buf + buf_len -
-						  config_len - 5);
-
-			if (lmp_version != project_id[proj_id]) {
-				RTKBT_ERR
-				    ("lmp_version is %x, project_id is %x, does not match!!!",
-				     lmp_version, project_id[proj_id]);
-				need_download_fw = 0;
-			} else {
-				RTKBT_DBG
-				    ("lmp_version is %x, project_id is %x, match!",
-				     lmp_version, project_id[proj_id]);
-				rtk_get_patch_entry(epatch_buf, &current_entry);
-
-				if (current_entry.patch_length == 0)
-					goto fw_fail;
-
-				buf_len =
-				    current_entry.patch_length + config_len;
-				RTKBT_DBG("buf_len = 0x%x", buf_len);
-
-				if (!(buf = kzalloc(buf_len, GFP_KERNEL))) {
-					RTKBT_ERR
-					    ("Can't alloc memory for multi fw&config");
-					buf_len = -1;
-				} else {
-					memcpy(buf,
-					       epatch_buf +
-					       current_entry.start_offset,
-					       current_entry.patch_length);
-					memcpy(buf + current_entry.patch_length - 4, epatch_buf + 8, 4);	/*fw version */
-					if (config_len) {
-						memcpy(&buf
-						       [buf_len - config_len],
-						       config_file_buf,
-						       config_len);
-					}
-				}
-			}
-		}
-	}
-
-	RTKBT_DBG("fw:%s exists, config file:%s exists",
-		  (buf_len > 0) ? "" : "not", (config_len > 0) ? "" : "not");
-	if (buf && (buf_len > 0) && (need_download_fw)) {
-		fw_len = buf_len;
-		*buff = buf;
-	}
-
-	RTKBT_DBG("load_firmware done");
-
-alloc_fail:
-	release_firmware(fw);
-
-	if (epatch_buf)
-		kfree(epatch_buf);
-
-	if (config_file_buf)
-		kfree(config_file_buf);
-fw_fail:
-	return fw_len;
-}
-
-void init_xdata(xchange_data * xdata, dev_data * dev_entry)
-{
-	memset(xdata, 0, sizeof(xchange_data));
-	xdata->dev_entry = dev_entry;
-	xdata->pipe_in = usb_rcvintpipe(dev_entry->udev, INTR_EP);
-	xdata->pipe_out = usb_sndctrlpipe(dev_entry->udev, CTRL_EP);
-	xdata->send_pkt = kzalloc(PKT_LEN, GFP_KERNEL);
-	xdata->rcv_pkt = kzalloc(PKT_LEN, GFP_KERNEL);
-	xdata->cmd_hdr = (struct hci_command_hdr *)(xdata->send_pkt);
-	xdata->evt_hdr = (struct hci_event_hdr *)(xdata->rcv_pkt);
-	xdata->cmd_cmp =
-	    (struct hci_ev_cmd_complete *)(xdata->rcv_pkt + EVT_HDR_LEN);
-	xdata->req_para = xdata->send_pkt + CMD_HDR_LEN;
-	xdata->rsp_para = xdata->rcv_pkt + EVT_HDR_LEN + CMD_CMP_LEN;
-}
-
-int check_fw_version(xchange_data * xdata)
-{
-	struct hci_rp_read_local_version *read_ver_rsp;
-	patch_info *patch_entry;
-	int ret_val;
-	int retry = 0;
-
-	/* Ensure that the first cmd is hci reset after system suspend
-	 * or system reboot */
-	send_reset_command(xdata);
-
-get_ver:
-	xdata->cmd_hdr->opcode = cpu_to_le16(HCI_OP_READ_LOCAL_VERSION);
-	xdata->cmd_hdr->plen = 0;
-	xdata->pkt_len = CMD_HDR_LEN;
-
-	ret_val = send_hci_cmd(xdata);
-	if (ret_val < 0) {
-		RTKBT_ERR("%s: Failed to send HCI command.", __func__);
-		goto version_end;
-	}
-
-	ret_val = rcv_hci_evt(xdata);
-	if (ret_val < 0) {
-		RTKBT_ERR("%s: Failed to receive HCI event.", __func__);
-		goto version_end;
-	}
-
-	patch_entry = xdata->dev_entry->patch_entry;
-	read_ver_rsp = (struct hci_rp_read_local_version *)(xdata->rsp_para);
-	read_ver_rsp->lmp_subver = le16_to_cpu(read_ver_rsp->lmp_subver);
-	read_ver_rsp->hci_rev = le16_to_cpu(read_ver_rsp->hci_rev);
-	read_ver_rsp->manufacturer = le16_to_cpu(read_ver_rsp->manufacturer);
-
-	RTKBT_DBG("read_ver_rsp->lmp_subver = 0x%x", read_ver_rsp->lmp_subver);
-	RTKBT_DBG("patch_entry->lmp_sub = 0x%x", patch_entry->lmp_sub);
-	if (patch_entry->lmp_sub != read_ver_rsp->lmp_subver) {
-		return 1;
-	}
-
-	ret_val = 0;
-version_end:
-	if (ret_val) {
-		send_reset_command(xdata);
-		retry++;
-		if (retry < 2)
-			goto get_ver;
-	}
-
-	return ret_val;
-}
-
-uint8_t rtk_get_eversion(dev_data * dev_entry)
-{
-	struct rtk_eversion_evt *eversion;
-	patch_info *patch_entry;
-	int ret_val = 0;
-	xchange_data *xdata = NULL;
-
-	RTKBT_DBG("%s: gEVersion %d", __func__, gEVersion);
-	if (gEVersion != 0xFF && gEVersion != 0xFE) {
-		RTKBT_DBG("gEVersion != 0xFF, return it directly!");
-		return gEVersion;
-	}
-
-	xdata = kzalloc(sizeof(xchange_data), GFP_KERNEL);
-	if (NULL == xdata) {
-		ret_val = 0xFE;
-		RTKBT_DBG("NULL == xdata");
-		return ret_val;
-	}
-
-	init_xdata(xdata, dev_entry);
-
-	xdata->cmd_hdr->opcode = cpu_to_le16(HCI_VENDOR_READ_RTK_ROM_VERISION);
-	xdata->cmd_hdr->plen = 0;
-	xdata->pkt_len = CMD_HDR_LEN;
-
-	ret_val = send_hci_cmd(xdata);
-	if (ret_val < 0) {
-		RTKBT_ERR("Failed to send read RTK rom version cmd.");
-		ret_val = 0xFE;
-		goto version_end;
-	}
-
-	ret_val = rcv_hci_evt(xdata);
-	if (ret_val < 0) {
-		RTKBT_ERR("Failed to receive HCI event for rom version.");
-		ret_val = 0xFE;
-		goto version_end;
-	}
-
-	patch_entry = xdata->dev_entry->patch_entry;
-	eversion = (struct rtk_eversion_evt *)(xdata->rsp_para);
-	RTKBT_DBG("eversion->status = 0x%x, eversion->version = 0x%x",
-		  eversion->status, eversion->version);
-	if (eversion->status) {
-		ret_val = 0;
-		//global_eversion = 0;
-	} else {
-		ret_val = eversion->version;
-		//global_eversion = eversion->version;
-	}
-
-version_end:
-	if (xdata != NULL) {
-		if (xdata->send_pkt)
-			kfree(xdata->send_pkt);
-		if (xdata->rcv_pkt)
-			kfree(xdata->rcv_pkt);
-		kfree(xdata);
-	}
-	return ret_val;
-}
-
-int download_data(xchange_data * xdata)
-{
-	download_cp *cmd_para;
-	download_rp *evt_para;
-	uint8_t *pcur;
-	int pkt_len, frag_num, frag_len;
-	int i, ret_val;
-
-	RTKBT_DBG("download_data start");
-
-	cmd_para = (download_cp *) xdata->req_para;
-	evt_para = (download_rp *) xdata->rsp_para;
-	pcur = xdata->fw_data;
-	pkt_len = CMD_HDR_LEN + sizeof(download_cp);
-	frag_num = xdata->fw_len / PATCH_SEG_MAX + 1;
-	frag_len = PATCH_SEG_MAX;
-
-	for (i = 0; i < frag_num; i++) {
-		cmd_para->index = i;
-		if (i == (frag_num - 1)) {
-			cmd_para->index |= DATA_END;
-			frag_len = xdata->fw_len % PATCH_SEG_MAX;
-			pkt_len -= (PATCH_SEG_MAX - frag_len);
-		}
-		xdata->cmd_hdr->opcode = cpu_to_le16(DOWNLOAD_OPCODE);
-		xdata->cmd_hdr->plen = sizeof(uint8_t) + frag_len;
-		xdata->pkt_len = pkt_len;
-		memcpy(cmd_para->data, pcur, frag_len);
-
-		ret_val = send_hci_cmd(xdata);
-		if (ret_val < 0) {
-			return ret_val;
-		}
-
-		ret_val = rcv_hci_evt(xdata);
-		if (ret_val < 0) {
-			return ret_val;
-		}
-
-		if (0 != evt_para->status) {
-			return -1;
-		}
-
-		pcur += PATCH_SEG_MAX;
-	}
-
-	RTKBT_DBG("download_data done");
-	return xdata->fw_len;
-}
-
-int send_hci_cmd(xchange_data * xdata)
-{
-	int ret_val;
-
-	ret_val = usb_control_msg(xdata->dev_entry->udev, xdata->pipe_out,
-				  0, USB_TYPE_CLASS, 0, 0,
-				  (void *)(xdata->send_pkt),
-				  xdata->pkt_len, MSG_TO);
-
-	if (ret_val < 0)
-		RTKBT_ERR("%s; failed to send ctl msg for hci cmd, err %d",
-			  __func__, ret_val);
-
-	return ret_val;
-}
-
-int rcv_hci_evt(xchange_data * xdata)
-{
-	int ret_len = 0, ret_val = 0;
-	int i;			// Added by Realtek
-
-	while (1) {
-		// **************************** Modifed by Realtek (begin)
-		for (i = 0; i < 5; i++)	// Try to send USB interrupt message 5 times.
-		{
-			ret_val =
-			    usb_interrupt_msg(xdata->dev_entry->udev,
-					      xdata->pipe_in,
-					      (void *)(xdata->rcv_pkt), PKT_LEN,
-					      &ret_len, MSG_TO);
-			if (ret_val >= 0)
-				break;
-		}
-		// **************************** Modifed by Realtek (end)
-
-		if (ret_val < 0) {
-			RTKBT_ERR("%s; no usb intr msg for hci event, err %d",
-				  __func__, ret_val);
-			return ret_val;
-		}
-
-		if (CMD_CMP_EVT == xdata->evt_hdr->evt) {
-			if (xdata->cmd_hdr->opcode == xdata->cmd_cmp->opcode)
-				return ret_len;
-		}
-	}
-}
-
-void print_acl(struct sk_buff *skb, int dataOut)
-{
-#if PRINT_ACL_DATA
-	uint wlength = skb->len;
-	uint icount = 0;
-	u16 *handle = (u16 *) (skb->data);
-	u16 dataLen = *(handle + 1);
-	u8 *acl_data = (u8 *) (skb->data);
-//if (0==dataOut)
-	printk("%d handle:%04x,len:%d,", dataOut, *handle, dataLen);
-//else
-//      printk("In handle:%04x,len:%d,",*handle,dataLen);
-/*	for(icount=4;(icount<wlength)&&(icount<32);icount++)
-		{
-			printk("%02x ",*(acl_data+icount) );
-		}
-	printk("\n");
-*/
-#endif
-}
-
-void print_command(struct sk_buff *skb)
-{
-#if PRINT_CMD_EVENT
-	uint wlength = skb->len;
-	uint icount = 0;
-	u16 *opcode = (u16 *) (skb->data);
-	u8 *cmd_data = (u8 *) (skb->data);
-	u8 paramLen = *(cmd_data + 2);
-
-	switch (*opcode) {
-	case HCI_OP_INQUIRY:
-		printk("HCI_OP_INQUIRY");
-		break;
-	case HCI_OP_INQUIRY_CANCEL:
-		printk("HCI_OP_INQUIRY_CANCEL");
-		break;
-	case HCI_OP_EXIT_PERIODIC_INQ:
-		printk("HCI_OP_EXIT_PERIODIC_INQ");
-		break;
-	case HCI_OP_CREATE_CONN:
-		printk("HCI_OP_CREATE_CONN");
-		break;
-	case HCI_OP_DISCONNECT:
-		printk("HCI_OP_DISCONNECT");
-		break;
-	case HCI_OP_CREATE_CONN_CANCEL:
-		printk("HCI_OP_CREATE_CONN_CANCEL");
-		break;
-	case HCI_OP_ACCEPT_CONN_REQ:
-		printk("HCI_OP_ACCEPT_CONN_REQ");
-		break;
-	case HCI_OP_REJECT_CONN_REQ:
-		printk("HCI_OP_REJECT_CONN_REQ");
-		break;
-	case HCI_OP_AUTH_REQUESTED:
-		printk("HCI_OP_AUTH_REQUESTED");
-		break;
-	case HCI_OP_SET_CONN_ENCRYPT:
-		printk("HCI_OP_SET_CONN_ENCRYPT");
-		break;
-	case HCI_OP_REMOTE_NAME_REQ:
-		printk("HCI_OP_REMOTE_NAME_REQ");
-		break;
-	case HCI_OP_READ_REMOTE_FEATURES:
-		printk("HCI_OP_READ_REMOTE_FEATURES");
-		break;
-	case HCI_OP_SNIFF_MODE:
-		printk("HCI_OP_SNIFF_MODE");
-		break;
-	case HCI_OP_EXIT_SNIFF_MODE:
-		printk("HCI_OP_EXIT_SNIFF_MODE");
-		break;
-	case HCI_OP_SWITCH_ROLE:
-		printk("HCI_OP_SWITCH_ROLE");
-		break;
-	case HCI_OP_SNIFF_SUBRATE:
-		printk("HCI_OP_SNIFF_SUBRATE");
-		break;
-	case HCI_OP_RESET:
-		printk("HCI_OP_RESET");
-		break;
-	default:
-		printk("CMD");
-		break;
-	}
-	printk(":%04x,len:%d,", *opcode, paramLen);
-	for (icount = 3; (icount < wlength) && (icount < 24); icount++) {
-		printk("%02x ", *(cmd_data + icount));
-	}
-	printk("\n");
-
-#endif
-}
-
-void print_event(struct sk_buff *skb)
-{
-#if PRINT_CMD_EVENT
-	uint wlength = skb->len;
-	uint icount = 0;
-	u8 *opcode = (u8 *) (skb->data);
-	u8 paramLen = *(opcode + 1);
-
-	switch (*opcode) {
-	case HCI_EV_INQUIRY_COMPLETE:
-		printk("HCI_EV_INQUIRY_COMPLETE");
-		break;
-	case HCI_EV_INQUIRY_RESULT:
-		printk("HCI_EV_INQUIRY_RESULT");
-		break;
-	case HCI_EV_CONN_COMPLETE:
-		printk("HCI_EV_CONN_COMPLETE");
-		break;
-	case HCI_EV_CONN_REQUEST:
-		printk("HCI_EV_CONN_REQUEST");
-		break;
-	case HCI_EV_DISCONN_COMPLETE:
-		printk("HCI_EV_DISCONN_COMPLETE");
-		break;
-	case HCI_EV_AUTH_COMPLETE:
-		printk("HCI_EV_AUTH_COMPLETE");
-		break;
-	case HCI_EV_REMOTE_NAME:
-		printk("HCI_EV_REMOTE_NAME");
-		break;
-	case HCI_EV_ENCRYPT_CHANGE:
-		printk("HCI_EV_ENCRYPT_CHANGE");
-		break;
-	case HCI_EV_CHANGE_LINK_KEY_COMPLETE:
-		printk("HCI_EV_CHANGE_LINK_KEY_COMPLETE");
-		break;
-	case HCI_EV_REMOTE_FEATURES:
-		printk("HCI_EV_REMOTE_FEATURES");
-		break;
-	case HCI_EV_REMOTE_VERSION:
-		printk("HCI_EV_REMOTE_VERSION");
-		break;
-	case HCI_EV_QOS_SETUP_COMPLETE:
-		printk("HCI_EV_QOS_SETUP_COMPLETE");
-		break;
-	case HCI_EV_CMD_COMPLETE:
-		printk("HCI_EV_CMD_COMPLETE");
-		break;
-	case HCI_EV_CMD_STATUS:
-		printk("HCI_EV_CMD_STATUS");
-		break;
-	case HCI_EV_ROLE_CHANGE:
-		printk("HCI_EV_ROLE_CHANGE");
-		break;
-	case HCI_EV_NUM_COMP_PKTS:
-		printk("HCI_EV_NUM_COMP_PKTS");
-		break;
-	case HCI_EV_MODE_CHANGE:
-		printk("HCI_EV_MODE_CHANGE");
-		break;
-	case HCI_EV_PIN_CODE_REQ:
-		printk("HCI_EV_PIN_CODE_REQ");
-		break;
-	case HCI_EV_LINK_KEY_REQ:
-		printk("HCI_EV_LINK_KEY_REQ");
-		break;
-	case HCI_EV_LINK_KEY_NOTIFY:
-		printk("HCI_EV_LINK_KEY_NOTIFY");
-		break;
-	case HCI_EV_CLOCK_OFFSET:
-		printk("HCI_EV_CLOCK_OFFSET");
-		break;
-	case HCI_EV_PKT_TYPE_CHANGE:
-		printk("HCI_EV_PKT_TYPE_CHANGE");
-		break;
-	case HCI_EV_PSCAN_REP_MODE:
-		printk("HCI_EV_PSCAN_REP_MODE");
-		break;
-	case HCI_EV_INQUIRY_RESULT_WITH_RSSI:
-		printk("HCI_EV_INQUIRY_RESULT_WITH_RSSI");
-		break;
-	case HCI_EV_REMOTE_EXT_FEATURES:
-		printk("HCI_EV_REMOTE_EXT_FEATURES");
-		break;
-	case HCI_EV_SYNC_CONN_COMPLETE:
-		printk("HCI_EV_SYNC_CONN_COMPLETE");
-		break;
-	case HCI_EV_SYNC_CONN_CHANGED:
-		printk("HCI_EV_SYNC_CONN_CHANGED");
-		break;
-	case HCI_EV_SNIFF_SUBRATE:
-		printk("HCI_EV_SNIFF_SUBRATE");
-		break;
-	case HCI_EV_EXTENDED_INQUIRY_RESULT:
-		printk("HCI_EV_EXTENDED_INQUIRY_RESULT");
-		break;
-	case HCI_EV_IO_CAPA_REQUEST:
-		printk("HCI_EV_IO_CAPA_REQUEST");
-		break;
-	case HCI_EV_SIMPLE_PAIR_COMPLETE:
-		printk("HCI_EV_SIMPLE_PAIR_COMPLETE");
-		break;
-	case HCI_EV_REMOTE_HOST_FEATURES:
-		printk("HCI_EV_REMOTE_HOST_FEATURES");
-		break;
-	default:
-		printk("event");
-		break;
-	}
-	printk(":%02x,len:%d,", *opcode, paramLen);
-	for (icount = 2; (icount < wlength) && (icount < 24); icount++) {
-		printk("%02x ", *(opcode + icount));
-	}
-	printk("\n");
-
-#endif
-}

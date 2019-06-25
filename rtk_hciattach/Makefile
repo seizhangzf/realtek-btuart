@@ -1,17 +1,17 @@
+CFLAGS := -Wall -g
+CROSS_COMPILE=$(TARGET_KERNEL_CROSS)
+CC := $(CROSS_COMPILE)gcc
 all: rtk_hciattach
+OBJS := hciattach.o hciattach_rtk.o hciattach_h4.o rtb_fwc.o
 
-ifeq ($(CC),)
-CC=gcc
-endif
+rtk_hciattach: $(OBJS)
+	$(CC) -o rtk_hciattach $(OBJS)
 
-rtk_hciattach: hciattach.c hciattach_rtk.o
-	$(CC) -o rtk_hciattach hciattach.c hciattach_rtk.o
-
-hciattach_rtk.o:hciattach_rtk.c
-	$(CC) -c hciattach_rtk.c
+%.o: %.c
+	$(CC) -c $< -o $@ $(CFLAGS)
 
 clean:
-	rm -f *.o  rtk_hciattach tags cscope.*
+	rm -f $(OBJS)  rtk_hciattach
 
 tags: FORCE
 	ctags -R

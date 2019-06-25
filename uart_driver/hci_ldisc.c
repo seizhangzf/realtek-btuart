@@ -48,13 +48,15 @@
 #include "rtk_coex.h"
 #endif
 
-#define VERSION "2.2"
+#define VERSION "2.2.8d1b888.20190618-192542"
 
 #if HCI_VERSION_CODE > KERNEL_VERSION(3, 4, 0)
 #define GET_DRV_DATA(x)		hci_get_drvdata(x)
 #else
 #define GET_DRV_DATA(x)		(struct hci_uart *)(x->driver_data)
 #endif
+
+#define SEMWAIT_TIMEOUT		50
 
 #if HCI_VERSION_CODE < KERNEL_VERSION(3, 4, 0)
 static int reset = 0;
@@ -116,66 +118,85 @@ static inline void hci_uart_tx_complete(struct hci_uart *hu, int pkt_type)
 	}
 }
 
+static inline void hci_proto_lock(struct hci_uart *hu)
+{
+	percpu_down_read(&hu->proto_lock);
+}
+
+static inline int hci_proto_trylock(struct hci_uart *hu)
+{
+	return percpu_down_read_trylock(&hu->proto_lock);
+}
+
+static inline void hci_proto_unlock(struct hci_uart *hu)
+{
+	percpu_up_read(&hu->proto_lock);
+}
+
 static inline struct sk_buff *hci_uart_dequeue(struct hci_uart *hu)
 {
 	struct sk_buff *skb = hu->tx_skb;
 
-	if (!skb)
-		skb = hu->proto->dequeue(hu);
-	else
+	if (!skb) {
+		hci_proto_lock(hu);
+
+		if (test_bit(HCI_UART_PROTO_READY, &hu->flags))
+			skb = hu->proto->dequeue(hu);
+
+		hci_proto_unlock(hu);
+	} else {
 		hu->tx_skb = NULL;
+	}
 
 	return skb;
 }
 
+/* This may be called in an IRQ context */
 int hci_uart_tx_wakeup(struct hci_uart *hu)
 {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 14, 0)
-	struct tty_struct *tty = hu->tty;
-	struct hci_dev *hdev = hu->hdev;
-	struct sk_buff *skb;
-#endif
-
-	if (test_and_set_bit(HCI_UART_SENDING, &hu->tx_state)) {
-		set_bit(HCI_UART_TX_WAKEUP, &hu->tx_state);
+	/* If acquiring lock fails we assume the tty is being closed because
+	 * that is the only time the write lock is acquired. If, however,
+	 * at some point in the future the write lock is also acquired in
+	 * other situations, then this must be revisited.
+	 */
+	if (!hci_proto_trylock(hu))
 		return 0;
+
+	/* proto_lock is locked */
+	if (!test_bit(HCI_UART_PROTO_READY, &hu->flags))
+		goto no_schedule;
+
+	if (in_interrupt()) {
+		if (test_and_set_bit(HCI_UART_SENDING, &hu->tx_state)) {
+			set_bit(HCI_UART_TX_WAKEUP, &hu->tx_state);
+			goto no_schedule;
+		}
+	} else {
+		if (down_timeout(&hu->tx_sem,
+				 msecs_to_jiffies(SEMWAIT_TIMEOUT)) == -ETIME) {
+			pr_warn("%s: Something went wrong with wait\n",
+				__func__);
+			goto no_schedule;
+		}
+		/* semaphore is locked */
+		if (test_and_set_bit(HCI_UART_SENDING, &hu->tx_state)) {
+			set_bit(HCI_UART_TX_WAKEUP, &hu->tx_state);
+			up(&hu->tx_sem);
+			goto no_schedule;
+		}
+		up(&hu->tx_sem);
 	}
 
 	BT_DBG("");
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
 	schedule_work(&hu->write_work);
-#else
- restart:
-	clear_bit(HCI_UART_TX_WAKEUP, &hu->tx_state);
 
-	while ((skb = hci_uart_dequeue(hu))) {
-		int len;
-
-		set_bit(TTY_DO_WRITE_WAKEUP, &tty->flags);
-		len = tty->ops->write(tty, skb->data, skb->len);
-		hdev->stat.byte_tx += len;
-
-		skb_pull(skb, len);
-		if (skb->len) {
-			hu->tx_skb = skb;
-			break;
-		}
-
-		hci_uart_tx_complete(hu, bt_cb(skb)->pkt_type);
-		kfree_skb(skb);
-	}
-
-	if (test_bit(HCI_UART_TX_WAKEUP, &hu->tx_state))
-		goto restart;
-
-	clear_bit(HCI_UART_SENDING, &hu->tx_state);
-#endif
+no_schedule:
+	hci_proto_unlock(hu);
 
 	return 0;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
 static void hci_uart_write_work(struct work_struct *work)
 {
 	struct hci_uart *hu = container_of(work, struct hci_uart, write_work);
@@ -207,13 +228,20 @@ static void hci_uart_write_work(struct work_struct *work)
 		kfree_skb(skb);
 	}
 
-	if (test_bit(HCI_UART_TX_WAKEUP, &hu->tx_state))
+	if (down_timeout(&hu->tx_sem, msecs_to_jiffies(SEMWAIT_TIMEOUT))) {
+		pr_warn("%s: Something went wrong with wait\n", __func__);
 		goto restart;
+	}
+	/* semaphore is locked */
+	if (test_bit(HCI_UART_TX_WAKEUP, &hu->tx_state)) {
+		up(&hu->tx_sem);
+		goto restart;
+	}
 
 	clear_bit(HCI_UART_SENDING, &hu->tx_state);
+	up(&hu->tx_sem);
 	return;
 }
-#endif
 
 /* ------- Interface to HCI layer ------ */
 /* Initialize device */
@@ -251,8 +279,12 @@ static int hci_uart_flush(struct hci_dev *hdev)
 	tty_ldisc_flush(tty);
 	tty_driver_flush_buffer(tty);
 
+	hci_proto_lock(hu);
+
 	if (test_bit(HCI_UART_PROTO_READY, &hu->flags))
 		hu->proto->flush(hu);
+
+	hci_proto_unlock(hu);
 
 	return 0;
 }
@@ -317,7 +349,15 @@ int hci_uart_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
 		rtk_btcoex_parse_l2cap_data_tx(skb->data, skb->len);
 #endif
 
+	hci_proto_lock(hu);
+
+	if (!test_bit(HCI_UART_PROTO_READY, &hu->flags)) {
+		hci_proto_unlock(hu);
+		return -EUNATCH;
+	}
+
 	hu->proto->enqueue(hu, skb);
+	hci_proto_unlock(hu);
 
 	hci_uart_tx_wakeup(hu);
 
@@ -382,13 +422,10 @@ static int hci_uart_tty_open(struct tty_struct *tty)
 	hu->tty = tty;
 	tty->receive_room = 65536;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
 	INIT_WORK(&hu->write_work, hci_uart_write_work);
-#endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 4, 0)
-	spin_lock_init(&hu->rx_lock);
-#endif
+	percpu_init_rwsem(&hu->proto_lock);
+	sema_init(&hu->tx_sem, 1);
 
 	/* Flush any pending characters in the driver and line discipline. */
 
@@ -424,11 +461,13 @@ static void hci_uart_tty_close(struct tty_struct *tty)
 	if (hdev)
 		hci_uart_close(hdev);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
-	cancel_work_sync(&hu->write_work);
-#endif
+	if (test_bit(HCI_UART_PROTO_READY, &hu->flags)) {
+		percpu_down_write(&hu->proto_lock);
+		clear_bit(HCI_UART_PROTO_READY, &hu->flags);
+		percpu_up_write(&hu->proto_lock);
 
-	if (test_and_clear_bit(HCI_UART_PROTO_READY, &hu->flags)) {
+		cancel_work_sync(&hu->write_work);
+
 		if (hdev) {
 			if (test_bit(HCI_UART_REGISTERED, &hu->flags))
 				hci_unregister_dev(hdev);
@@ -437,6 +476,7 @@ static void hci_uart_tty_close(struct tty_struct *tty)
 		hu->proto->close(hu);
 	}
 	clear_bit(HCI_UART_PROTO_SET, &hu->flags);
+	percpu_free_rwsem(&hu->proto_lock);
 
 	kfree(hu);
 }
@@ -483,28 +523,32 @@ static void hci_uart_tty_receive(struct tty_struct *tty, const u8 * data,
 				 char *flags, int count)
 {
 	struct hci_uart *hu = (void *)tty->disc_data;
+	int (*proto_receive)(struct hci_uart *hu, void *data, int len);
 
 	if (!hu || tty != hu->tty)
 		return;
 
-	if (!test_bit(HCI_UART_PROTO_READY, &hu->flags))
-		return;
+	hci_proto_lock(hu);
 
+	if (!test_bit(HCI_UART_PROTO_READY, &hu->flags)) {
+		hci_proto_unlock(hu);
+		return;
+	}
+
+	proto_receive = hu->proto->recv;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
+	proto_receive(hu, (void *)data, count);
+	hci_proto_unlock(hu);
+#else
+	hci_proto_unlock(hu);
 	/* It does not need a lock here as it is already protected by a mutex in
 	 * tty caller
 	 */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 4, 0)
-	spin_lock(&hu->rx_lock);
+	proto_receive(hu, (void *)data, count);
 #endif
-
-	hu->proto->recv(hu, (void *)data, count);
 
 	if (hu->hdev)
 		hu->hdev->stat.byte_rx += count;
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 4, 0)
-	spin_unlock(&hu->rx_lock);
-#endif
 
 	tty_unthrottle(tty);
 }
@@ -586,6 +630,10 @@ static int hci_uart_register_dev(struct hci_uart *hu)
 #else
 		hdev->dev_type = HCI_PRIMARY;
 #endif
+#endif
+
+#if HCI_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)
+	set_bit(HCI_QUIRK_SIMULTANEOUS_DISCOVERY, &hdev->quirks);
 #endif
 
 	if (hci_register_dev(hdev) < 0) {
