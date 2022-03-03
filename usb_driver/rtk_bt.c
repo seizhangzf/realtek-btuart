@@ -35,7 +35,7 @@
 #include "rtk_bt.h"
 #include "rtk_misc.h"
 
-#define VERSION "3.1.897f3bb.20201104-164839"
+#define VERSION "3.1.156d109.20220110-123626"
 
 #ifdef BTCOEX
 #include "rtk_coex.h"
@@ -50,6 +50,7 @@ DEFINE_SEMAPHORE(switch_sem);
 #if HCI_VERSION_CODE >= KERNEL_VERSION(3, 7, 1)
 static bool reset = 0;
 #endif
+int set_scan(struct usb_interface *intf);
 
 static struct usb_driver btusb_driver;
 static struct usb_device_id btusb_table[] = {
@@ -78,6 +79,62 @@ static struct usb_device_id btusb_table[] = {
 		.match_flags = USB_DEVICE_ID_MATCH_VENDOR |
 			USB_DEVICE_ID_MATCH_INT_INFO,
 		.idVendor = 0x1358,
+		.bInterfaceClass = 0xe0,
+		.bInterfaceSubClass = 0x01,
+		.bInterfaceProtocol = 0x01
+	}, {
+		.match_flags = USB_DEVICE_ID_MATCH_VENDOR |
+			USB_DEVICE_ID_MATCH_INT_INFO,
+		.idVendor = 0x04ca,
+		.bInterfaceClass = 0xe0,
+		.bInterfaceSubClass = 0x01,
+		.bInterfaceProtocol = 0x01
+	}, {
+		.match_flags = USB_DEVICE_ID_MATCH_VENDOR |
+			USB_DEVICE_ID_MATCH_INT_INFO,
+		.idVendor = 0x2ff8,
+		.bInterfaceClass = 0xe0,
+		.bInterfaceSubClass = 0x01,
+		.bInterfaceProtocol = 0x01
+	}, {
+		.match_flags = USB_DEVICE_ID_MATCH_VENDOR |
+			USB_DEVICE_ID_MATCH_INT_INFO,
+		.idVendor = 0x0b05,
+		.bInterfaceClass = 0xe0,
+		.bInterfaceSubClass = 0x01,
+		.bInterfaceProtocol = 0x01
+	}, {
+		.match_flags = USB_DEVICE_ID_MATCH_VENDOR |
+			USB_DEVICE_ID_MATCH_INT_INFO,
+		.idVendor = 0x0930,
+		.bInterfaceClass = 0xe0,
+		.bInterfaceSubClass = 0x01,
+		.bInterfaceProtocol = 0x01
+	}, {
+		.match_flags = USB_DEVICE_ID_MATCH_VENDOR |
+			USB_DEVICE_ID_MATCH_INT_INFO,
+		.idVendor = 0x10ec,
+		.bInterfaceClass = 0xe0,
+		.bInterfaceSubClass = 0x01,
+		.bInterfaceProtocol = 0x01
+	}, {
+		.match_flags = USB_DEVICE_ID_MATCH_VENDOR |
+			USB_DEVICE_ID_MATCH_INT_INFO,
+		.idVendor = 0x04c5,
+		.bInterfaceClass = 0xe0,
+		.bInterfaceSubClass = 0x01,
+		.bInterfaceProtocol = 0x01
+	}, {
+		.match_flags = USB_DEVICE_ID_MATCH_VENDOR |
+			USB_DEVICE_ID_MATCH_INT_INFO,
+		.idVendor = 0x0cb5,
+		.bInterfaceClass = 0xe0,
+		.bInterfaceSubClass = 0x01,
+		.bInterfaceProtocol = 0x01
+	}, {
+		.match_flags = USB_DEVICE_ID_MATCH_VENDOR |
+			USB_DEVICE_ID_MATCH_INT_INFO,
+		.idVendor = 0x0cb8,
 		.bInterfaceClass = 0xe0,
 		.bInterfaceSubClass = 0x01,
 		.bInterfaceProtocol = 0x01
@@ -1037,6 +1094,9 @@ static void btusb_notify(struct hci_dev *hdev, unsigned int evt)
 	if (SCO_NUM != data->sco_num) {
 		data->sco_num = SCO_NUM;
 		RTKBT_DBG("%s: Update sco num %d", __func__, data->sco_num);
+#if HCI_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+		data->air_mode = evt;
+#endif
 		schedule_work(&data->work);
 	}
 }
@@ -1086,12 +1146,70 @@ static inline int __set_isoc_interface(struct hci_dev *hdev, int altsetting)
 	return 0;
 }
 
+#if HCI_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+static int btusb_switch_alt_setting(struct hci_dev *hdev, int new_alts)
+{
+	struct btusb_data *data = hci_get_drvdata(hdev);
+	int err;
+
+	if (data->isoc_altsetting != new_alts) {
+		unsigned long flags;
+
+		clear_bit(BTUSB_ISOC_RUNNING, &data->flags);
+		usb_kill_anchored_urbs(&data->isoc_anchor);
+
+		/* When isochronous alternate setting needs to be
+		 * changed, because SCO connection has been added
+		 * or removed, a packet fragment may be left in the
+		 * reassembling state. This could lead to wrongly
+		 * assembled fragments.
+		 *
+		 * Clear outstanding fragment when selecting a new
+		 * alternate setting.
+		 */
+		spin_lock_irqsave(&data->rxlock, flags);
+		kfree_skb(data->sco_skb);
+		data->sco_skb = NULL;
+		spin_unlock_irqrestore(&data->rxlock, flags);
+
+		err = __set_isoc_interface(hdev, new_alts);
+		if (err < 0)
+			return err;
+	}
+
+	if (!test_and_set_bit(BTUSB_ISOC_RUNNING, &data->flags)) {
+		if (btusb_submit_isoc_urb(hdev, GFP_KERNEL) < 0)
+			clear_bit(BTUSB_ISOC_RUNNING, &data->flags);
+		else
+			btusb_submit_isoc_urb(hdev, GFP_KERNEL);
+	}
+
+	return 0;
+}
+
+static struct usb_host_interface *btusb_find_altsetting(struct btusb_data *data,
+							int alt)
+{
+	struct usb_interface *intf = data->isoc;
+	int i;
+
+	BT_DBG("Looking for Alt no :%d", alt);
+
+	for (i = 0; i < intf->num_altsetting; i++) {
+		if (intf->altsetting[i].desc.bAlternateSetting == alt)
+			return &intf->altsetting[i];
+	}
+
+	return NULL;
+}
+#endif
+
 static void btusb_work(struct work_struct *work)
 {
 	struct btusb_data *data = container_of(work, struct btusb_data, work);
 	struct hci_dev *hdev = data->hdev;
 	int err;
-	int new_alts;
+	int new_alts = 0;
 
 	RTKBT_DBG("%s: sco num %d", __func__, data->sco_num);
 	if (data->sco_num > 0) {
@@ -1108,7 +1226,22 @@ static void btusb_work(struct work_struct *work)
 
 			set_bit(BTUSB_DID_ISO_RESUME, &data->flags);
 		}
-#if HCI_VERSION_CODE > KERNEL_VERSION(3, 7, 1)
+#if HCI_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+		if (data->air_mode == HCI_NOTIFY_ENABLE_SCO_CVSD) {
+			if (hdev->voice_setting & 0x0020) {
+				static const int alts[3] = { 2, 4, 5 };
+				new_alts = alts[data->sco_num - 1];
+			} else {
+				new_alts = data->sco_num;
+			}
+		} else if (data->air_mode == HCI_NOTIFY_ENABLE_SCO_TRANSP) {
+			new_alts = btusb_find_altsetting(data, 6) ? 6 : 1;
+		}
+
+		if (btusb_switch_alt_setting(hdev, new_alts) < 0)
+				RTKBT_ERR("set USB alt:(%d) failed!", new_alts);
+#else
+#if HCI_VERSION_CODE >= KERNEL_VERSION(3, 5, 0)
 		if (hdev->voice_setting & 0x0020) {
 			static const int alts[3] = { 2, 4, 5 };
 			new_alts = alts[data->sco_num - 1];
@@ -1136,6 +1269,7 @@ static void btusb_work(struct work_struct *work)
 			else
 				btusb_submit_isoc_urb(hdev, GFP_KERNEL);
 		}
+#endif
 	} else {
 		clear_bit(BTUSB_ISOC_RUNNING, &data->flags);
 		mdelay(URB_CANCELING_DELAY_MS);
@@ -1303,13 +1437,14 @@ int rtkbt_pm_notify(struct notifier_block *notifier,
 		msleep(100); /* From FW colleague's recommendation */
 		result = download_lps_patch(intf);
 
+
+		/* Send special vendor commands */
+#endif
 		/* Tell the controller to wake up host if received special
 		 * advertising packet
 		 */
 		set_scan(intf);
 
-		/* Send special vendor commands */
-#endif
 
 #ifdef RTKBT_TV_POWERON_WHITELIST
 		result = rtkbt_lookup_le_device_poweron_whitelist(hdev, udev);
